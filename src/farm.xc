@@ -22,12 +22,12 @@ typedef unsigned char uchar;
  *  e.g. IMWD = 120, HEIGHT = 64
  */
 #define MAX_BYTES 6900  //val above this causes fopen error; perror() gives ENOMEM "Not enough space"
-#define IMHT (130-130%4) //img height. Must be a multiple of 4 to allow equal farming of image
+#define IMHT (128-128%4) //img height. Must be a multiple of 4 to allow equal farming of image
 #define IMWD 128 //img width
 #if IMWD*(IMHT/4) <= MAX_BYTES
     #define HEIGHT IMHT/4
 #else
-    #define HEIGHT MAX_BYTES/IMWD
+    #define HEIGHT IMHT/4 //MAX_BYTES/IMWD
 #endif
 
 //#define HEIGHT 32    //height of worker chunk
@@ -193,7 +193,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
     //arrays to hold the chunk of the image to work on, with an extra
     //line above and below for the neighbours we'll read but won't write
     uchar img[HEIGHT + 2][IMWD];
-    uchar new_img[HEIGHT][IMWD];
+    uchar buffer_img[3][IMWD];
 
     while(running) {
         if(mode == MODE_IDLE) {
@@ -215,9 +215,9 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
             mode = MODE_RUNNING;
         } else if(mode == MODE_HARVEST) {
             //send data back
-            for (int y = 0; y < HEIGHT; y++) {
+            for (int y = 1; y < HEIGHT + 1; y++) {
                 for (int x = 0; x < IMWD; x++) {
-                    farmer <: new_img[y][x];    //TODO: send from new image
+                    farmer <: img[y][x];
                 }
             }
             mode = MODE_RUNNING;
@@ -230,6 +230,13 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
             //reset alive count for next iteration
             aliveCount = 0;
 
+            //copy first 3 rows into buffer_img
+            for(int y = 0; y < 3; y++) {
+                for(int x = 0; x < IMWD; x++) {
+                    buffer_img[y][x] = img[y][x];
+                }
+            }
+
             //  *** PROCESS DATA ***
             int n_count = 0;
             for(int y = 1; y < HEIGHT + 1; y++) {   //loop through only the parts of the image we'll write to
@@ -239,30 +246,35 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                             if(i==0 && j==0) {  //careful not to count yourself as a neighbour!
                                 continue;
                             } else {
-                                if(img[mod(y+j, IMHT)][mod(x+i, IMWD)] == ALIVE) {  //count the neighbours
+                                if(buffer_img[mod(1 + j, IMHT)][mod(x+i, IMWD)] == ALIVE) {  //count the neighbours
                                     n_count++;
                                 }
                             }
                         }
                     }
                     //implement game of life rules
-                    if(img[y][x] == ALIVE) {
+                    if(buffer_img[1][x] == ALIVE) {
                         aliveCount++;
                         if(n_count < 2) {
-                            new_img[y-1][x] = DEAD;
+                            img[y][x] = DEAD;
                         } else if(n_count == 2 || n_count == 3) {
-                            new_img[y-1][x] = ALIVE;
+                            img[y][x] = ALIVE;
                         } else if(n_count > 3) {
-                            new_img[y-1][x] = DEAD;
+                            img[y][x] = DEAD;
                         }
                     } else {
                         if(n_count == 3) {
-                            new_img[y-1][x] = ALIVE;
+                            img[y][x] = ALIVE;
                         } else {
-                            new_img[y-1][x] = DEAD;
+                            img[y][x] = DEAD;
                         }
                     }
                     n_count = 0;    //reset neighbour count for next cell
+                }
+                if(y != HEIGHT) {
+                    memcpy(buffer_img[0], buffer_img[1], sizeof(buffer_img[0]));
+                    memcpy(buffer_img[1], buffer_img[2], sizeof(buffer_img[1]));
+                    memcpy(buffer_img[2], img[y+2], sizeof(buffer_img[2]));
                 }
             }
 
@@ -281,24 +293,17 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
              */
             if(worker_id % 2 == 0) {
                 for(int x = 0; x < IMWD; x++) {
-                    worker_below <: new_img[HEIGHT - 1][x];
+                    worker_below <: img[HEIGHT][x];
                     worker_below :> img[HEIGHT + 1][x];
                     worker_above :> img[0][x];
-                    worker_above <: new_img[0][x];
+                    worker_above <: img[1][x];
                 }
             } else {    //odd id workers
                 for(int x = 0; x < IMWD; x++) {
                     worker_above :> img[0][x];
-                    worker_above <: new_img[0][x];
-                    worker_below <: new_img[HEIGHT - 1][x];
+                    worker_above <: img[1][x];
+                    worker_below <: img[HEIGHT][x];
                     worker_below :> img[HEIGHT + 1][x];
-                }
-            }
-
-            //copy new_img data to img ready for next iteration
-            for(int y = 0; y < HEIGHT; y++) {
-                for(int x = 0; x < IMWD; x++) {
-                    img[y+1][x] = new_img[y][x];
                 }
             }
         }
@@ -418,6 +423,7 @@ void distributor(chanend c_in, chanend c_out, chanend workers[4], chanend c_butt
                     c_out <: val;
                 }
             }
+
             printf("HARVEST COMPLETE\n");
             mode = MODE_RUNNING;
             c_visualiser <: mode;   //update vis to running (otherwise stuck in idle/farm/harvest)
@@ -595,7 +601,6 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
 //      fix testout.pgm premature end of file
 int main() {
     chan c_inIO, c_outIO;   //channels to read and write the image
-    //chan worker0, worker1, worker2, worker3; //a channel for each worker thread
     chan workers[4], quadrants[4];
     chan c_01, c_12, c_23, c_30;
     chan c_buttons, c_visualiser;
