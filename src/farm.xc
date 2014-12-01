@@ -17,20 +17,11 @@ typedef unsigned char uchar;
 #include <stdio.h>
 #include "pgmIO.h"
 
-/*  BY TRIAL AND ERROR, ~7920 bytes seems to be the most that
- *  you can handle per core i.e. in img[Height+2][IMWD] where
- *  e.g. IMWD = 120, HEIGHT = 64
- */
-#define MAX_BYTES 6900  //val above this causes fopen error; perror() gives ENOMEM "Not enough space"
-#define IMHT (128-128%4) //img height. Must be a multiple of 4 to allow equal farming of image
-#define IMWD 128 //img width
-#if IMWD*(IMHT/4) <= MAX_BYTES
-    #define HEIGHT IMHT/4
-#else
-    #define HEIGHT IMHT/4 //MAX_BYTES/IMWD
-#endif
+#define NUM_CORES 3 //MUST BE 3 or 4! The worker thread declarations in main must also be adjusted accordingly.
+#define IMHT 256 //full height of image
+#define IMWD 256 //img width
+#define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 
-//#define HEIGHT 32    //height of worker chunk
 #define ALIVE 255
 #define DEAD 0
 #define CELLCOUNT IMHT*IMWD
@@ -61,6 +52,7 @@ in port buttons = PORT_BUTTON;
 
 const char infname[] = "test.pgm"; //put your input image path here, absolute path
 const char outfname[] = "testout.pgm"; //put your output image path here, absolute path
+
 /////////////////////////////////////////////////////////////////////////////////////////
 //
 // helper functions
@@ -107,10 +99,10 @@ void waitMoment(int duration) {
  *
  * NOTE: with 12 bits the max number to display is 4095
  */
-{int, int, int, int} getBinaryLightPattern(int decimal) {
+{unsigned int, unsigned int, unsigned int, unsigned int} getBinaryLightPattern(int decimal) {
     if(decimal > 4095) decimal = mod(decimal, 4095);  //max val permissible is 4095
     uchar binary[12] = {0}; //binary string
-    int i = 0;
+    uchar i = 0;
     while(decimal > 0)
     {
         binary[i] = decimal % 2;    //remainder is current bit
@@ -118,9 +110,9 @@ void waitMoment(int duration) {
         i++;
     }
 
-    int msf;
-    int val = 0;
-    int pattern[4]; //holds each of the LED vals
+    uchar msf;
+    uchar val = 0;
+    unsigned int pattern[4]; //holds each of the LED vals
     i = 0;
     for(int n = 0; n < 12; n+=3) {  //go through the binary in chunks of 3 bits
         val = 0;
@@ -145,7 +137,7 @@ void DataInStream(const char infname[], chanend c_out) {
     int res;
     int running = 1;
     int mode = MODE_RUNNING;
-    uchar line[IMWD];  //array to store the whole image
+    uchar line[IMWD];
     printf("DataInStream:Start...\n");
     while(running) {
         if(mode == MODE_RUNNING || mode == MODE_IDLE) {
@@ -160,14 +152,6 @@ void DataInStream(const char infname[], chanend c_out) {
                 return;
             }
 
-            /*
-             * Loop through a worker chunk of the image, accomodating for an extra line above
-             * and below to store the neighbours which that worker will not modify.
-             * Do this for each of the 4 workers.
-             *
-             * n * HEIGHT - 1   gets you to the line behind the one the worker will be accessing.
-             * + y              gets you to the current row
-             */
             for (int y = 0; y < IMHT; y++) {
                 _readinline(line, IMWD);
                 for (int x = 0; x < IMWD; x++) {
@@ -184,29 +168,32 @@ void DataInStream(const char infname[], chanend c_out) {
     return;
 }
 
-//TODO: implement a cache for the neighbours rather than reading in the whole img before processing
 void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend worker_above) {
     printf("GameOfLife:Start\n");
     int mode = MODE_IDLE;
     int aliveCount = 0;
     int running = 1;
-    //arrays to hold the chunk of the image to work on, with an extra
+    //array to hold the chunk of the image to work on, with an extra
     //line above and below for the neighbours we'll read but won't write
-    uchar img[HEIGHT + 2][IMWD];
+    uchar img[HEIGHT + IMHT%NUM_CORES + 2][IMWD];
+    //3 lines used to read the neighbour values, (where they wont get
+    //overwritten by the updating of the cells). The middle line at anytime is the line
+    //to be updated.
     uchar buffer_img[3][IMWD];
-
+    int h;  //the height of the chunk this worker is working on
     while(running) {
         if(mode == MODE_IDLE) {
             farmer :> mode;
         } else if(mode == MODE_PAUSED) {
             farmer :> mode;
         } else if(mode == MODE_FARM) {
-            //printf("GoL FARM\n");
             //read data in from farmer
-            for (int y = 0; y < HEIGHT + 2; y++) {
+            farmer :> h;    //read in the chunk height this worker is processing
+            for (int y = 0; y < h + 2; y++) {   //+2 to compensate for the extra read-only lines
                 for (int x = 0; x < IMWD; x++) {
+                    //worker0 will receive its top buffer line AFTER the rest of the chunk, so mod to put in the right place
                     if(worker_id == 0) {
-                        farmer :> img[mod(y+1, HEIGHT + 2)][x];
+                        farmer :> img[mod(y+1, h + 2)][x];
                     } else {
                         farmer :> img[y][x];
                     }
@@ -214,8 +201,8 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
             }
             mode = MODE_RUNNING;
         } else if(mode == MODE_HARVEST) {
-            //send data back
-            for (int y = 1; y < HEIGHT + 1; y++) {
+            //send data back to farmer
+            for (int y = 1; y < h + 1; y++) {
                 for (int x = 0; x < IMWD; x++) {
                     farmer <: img[y][x];
                 }
@@ -239,7 +226,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 
             //  *** PROCESS DATA ***
             int n_count = 0;
-            for(int y = 1; y < HEIGHT + 1; y++) {   //loop through only the parts of the image we'll write to
+            for(int y = 1; y < h + 1; y++) {   //loop through only the parts of the image we'll write to
                 for(int x = 0; x < IMWD; x++) {
                     for(int j = -1; j <= 1; j++) {  //loop through the neighbours
                         for(int i = -1; i <= 1; i++) {
@@ -271,7 +258,8 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                     }
                     n_count = 0;    //reset neighbour count for next cell
                 }
-                if(y != HEIGHT) {
+                //shift the buffer down
+                if(y != h) {
                     memcpy(buffer_img[0], buffer_img[1], sizeof(buffer_img[0]));
                     memcpy(buffer_img[1], buffer_img[2], sizeof(buffer_img[1]));
                     memcpy(buffer_img[2], img[y+2], sizeof(buffer_img[2]));
@@ -293,8 +281,8 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
              */
             if(worker_id % 2 == 0) {
                 for(int x = 0; x < IMWD; x++) {
-                    worker_below <: img[HEIGHT][x];
-                    worker_below :> img[HEIGHT + 1][x];
+                    worker_below <: img[h][x];
+                    worker_below :> img[h + 1][x];
                     worker_above :> img[0][x];
                     worker_above <: img[1][x];
                 }
@@ -302,8 +290,8 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                 for(int x = 0; x < IMWD; x++) {
                     worker_above :> img[0][x];
                     worker_above <: img[1][x];
-                    worker_below <: img[HEIGHT][x];
-                    worker_below :> img[HEIGHT + 1][x];
+                    worker_below <: img[h][x];
+                    worker_below :> img[h + 1][x];
                 }
             }
         }
@@ -313,35 +301,37 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 
 /////////////////////////////////////////////////////////////////////////////////////////
 //
-// Start your implementation by changing this function to farm out parts of the image...
+// The farmer.
 //
 /////////////////////////////////////////////////////////////////////////////////////////
-void distributor(chanend c_in, chanend c_out, chanend workers[4], chanend c_buttons, chanend c_visualiser) {//chanend worker0, chanend worker1, chanend worker2, chanend worker3, chanend c_buttons) {
+void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanend c_buttons, chanend c_visualiser) {
     uchar val;
     int running = 1;
     int buttonPress;
     int mode = MODE_IDLE;
     int aliveCount = 0; //total no. of alive cells
     int gen = 0;    //the current generation
+    int heights[NUM_CORES]; //array to store the heights of the chunks to be processed by the workers
+    heights[0] = HEIGHT + IMHT%NUM_CORES;   //the first worker takes any extra work (remainder) that doesnt divide by the num of workers
+    for(int i = 1; i < NUM_CORES; i++) {    //each of the other heights are as normal
+        heights[i] = HEIGHT;
+    }
     printf("ProcessImage:Start, size = %dx%d\n", IMHT, IMWD);
     while(running) {
         if(mode == MODE_IDLE) {
-            //printf("MODE IDLE\n");
             c_buttons :> buttonPress;
             if(buttonPress == BUTTON_A) {
                 mode = MODE_FARM;
             } else if(buttonPress == BUTTON_D) {
                 mode = MODE_TERMINATE;
             }
-            workers[0] <: mode;
-            workers[1] <: mode;
-            workers[2] <: mode;
-            workers[3] <: mode;
+            for(int i = 0; i < NUM_CORES; i++) {
+                workers[i] <: mode;
+            }
             c_visualiser <: mode;
             c_in <: mode;
             c_out <: mode;
         } else if(mode == MODE_RUNNING) {
-            //printf("RUNNING\n");
             aliveCount = 0; //init number of alive cells
             c_buttons :> buttonPress;
             if(buttonPress == BUTTON_A) {
@@ -355,7 +345,7 @@ void distributor(chanend c_in, chanend c_out, chanend workers[4], chanend c_butt
             }
             //update the workers on the current mode and get the number of alive cells in each
             int alive;
-            for(int n = 0; n < 4; n++) {
+            for(int n = 0; n < NUM_CORES; n++) {
                 workers[n] <: mode;
                 workers[n] :> alive;
                 aliveCount += alive;
@@ -366,26 +356,23 @@ void distributor(chanend c_in, chanend c_out, chanend workers[4], chanend c_butt
             c_in <: mode;
             c_out <: mode;
         } else if(mode == MODE_PAUSED) {
-            //printf("PAUSED\n");
             c_buttons :> buttonPress;
             c_visualiser <: mode;
             c_visualiser <: gen;    //tell vis which gen we are on to display it
             if(buttonPress == BUTTON_B) {
                 mode = MODE_RUNNING;
-                workers[0] <: mode;
-                workers[1] <: mode;
-                workers[2] <: mode;
-                workers[3] <: mode;
+                for(int i = 0; i < NUM_CORES; i++) {
+                    workers[i] <: mode;
+                }
                 c_visualiser <: mode;
                 c_visualiser <: gen;
                 c_in <: mode;
                 c_out <: mode;
             } else if(buttonPress == BUTTON_D) {
                 mode = MODE_TERMINATE;
-                workers[0] <: mode;
-                workers[1] <: mode;
-                workers[2] <: mode;
-                workers[3] <: mode;
+                for(int i = 0; i < NUM_CORES; i++) {
+                    workers[i] <: mode;
+                }
                 c_visualiser <: mode;
                 c_visualiser <: gen;
                 c_in <: mode;
@@ -393,37 +380,56 @@ void distributor(chanend c_in, chanend c_out, chanend workers[4], chanend c_butt
             }
         } else if(mode == MODE_FARM) {
             printf("FARM\n");
+            int cumulative_heights[NUM_CORES];  //stores the indices of the boundaries
+            //set these boundaries:
+            cumulative_heights[0] = heights[0];
+            for(int i = 1; i < NUM_CORES; i++) {
+                cumulative_heights[i] = cumulative_heights[i-1] + heights[i];
+            }
+            //tell the workers the size of the chunk they are processing
+            for(int i = 0; i < NUM_CORES; i++) {
+                workers[i] <: heights[i];
+            }
             //Farm out the work
-            int m;
             for (int y = 0; y < IMHT; y++) {
-                m = mod(y, HEIGHT);
-                //printf("sending to worker %d\n", y/HEIGHT);
-                for (int x = 0; x < IMWD; x++) {
-                    c_in :> val;
-                    if(m == 0) {
-                        //printf("AS WELL AS, sending to worker %d\n", mod(3 + y/HEIGHT, 4));
-                        workers[mod(3 + y/(int)(HEIGHT), 4)] <: val;
-                    } else if(m == HEIGHT - 1) {
-                        //printf("AS WELL AS, sending to worker %d\n", mod(1 + y/HEIGHT, 4));
-                        workers[mod(1 + y/(int)(HEIGHT), 4)] <: val;
+                for(int x = 0; x < IMWD; x++) {
+                    c_in :> val; //read in the cell value
+                    //decide which workers to send this to based on whether it is between the correct boundaries.
+                    //Note the preprocessing directives used to compile the correct code for the number of workers in use.
+                    if(y == IMHT - 1 || (y >= 0 && y <= cumulative_heights[0])) {
+                        workers[0] <: val;
                     }
-                    workers[y/(int)(HEIGHT)] <: val;
+                    if(y >= cumulative_heights[0] - 1 && y <= cumulative_heights[1]) {
+                        workers[1] <: val;
+                    }
+#if(NUM_CORES == 3)
+                        if(y == 0 ||(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2] - 1)) {
+                            workers[2] <: val;
+                        }
+#elif(NUM_CORES == 4)
+                        if(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2]) {
+                            workers[2] <: val;
+                        }
+                        if(y == 0 ||(y >= cumulative_heights[2] - 1 && y <= cumulative_heights[3] - 1)) {
+                            workers[3] <: val;
+                        }
+#endif
                 }
-                //printf("y = %d\n", y);
             }
             printf("FARM COMPLETE\n");
             mode = MODE_RUNNING;
             c_visualiser <: mode;   //update vis to running (otherwise stuck in idle/farm/harvest)
         } else if(mode == MODE_HARVEST) {
             printf("HARVEST\n");
-            //harvest and output data
-            for (int y = 0; y < IMHT; y++) {
-                for (int x = 0; x < IMWD; x++) {
-                    workers[y/(int)(HEIGHT)] :> val;
-                    c_out <: val;
+            //harvest and output data from each worker
+            for(uchar i = 0; i < NUM_CORES; i++) {
+                for (int y = 0; y < heights[i]; y++) {
+                    for (int x = 0; x < IMWD; x++) {
+                        workers[i] :> val;
+                        c_out <: val;
+                    }
                 }
             }
-
             printf("HARVEST COMPLETE\n");
             mode = MODE_RUNNING;
             c_visualiser <: mode;   //update vis to running (otherwise stuck in idle/farm/harvest)
@@ -457,24 +463,14 @@ void DataOutStream(const char outfname[], chanend c_in) {
                 printf("DataOutStream:Error opening %s\n.", outfname);
                 return;
             }
-            /*
-             * Loop through a worker chunk of the image, accomodating for an extra line above
-             * and below to store the neighbours which that worker will not modify.
-             * Do this for each of the 4 workers.
-             *
-             * n * HEIGHT - 1   gets you to the line behind the one the worker will be accessing.
-             * + y              gets you to the current row
-             */
+
             for (int y = 0; y < IMHT; y++) {
                 for (int x = 0; x < IMWD; x++) {
                     c_in :> line[x];
-                    //printf("-%4.1d ", line[x]);
                 }
                 _writeoutline(line, IMWD);
-                //printf("\n");
             }
 
-            //print_img(img); //print the image to stdout for easy viewing
             _closeoutpgm();
             mode = MODE_RUNNING;
         } else if(mode == MODE_TERMINATE) {
@@ -505,11 +501,11 @@ void buttonListener(in port b, chanend farmer) {
             }
             isReleased = 0; //they were pressed so released is now false
         }
-        farmer <: r; // send button pattern to userAnt
+        farmer <: r; // send button pattern to farmer
         if(r == BUTTON_D) {
             running = 0;
         }
-        waitMoment(10000000); //pause to let user release button
+        waitMoment(1000000); //pause to let user release button
     }
     printf("Buttons terminated. Goodbye!\n");
 }
@@ -539,7 +535,6 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
     int mode = MODE_IDLE;
     while (running) {
         if(mode == MODE_IDLE || mode == MODE_FARM || mode == MODE_HARVEST) {
-            //printf("VIS IDLE/FARM/HARVEST %d\n", mode);
             farmer :> mode;
         } else if(mode == MODE_RUNNING) {   /***display the number of alive cells***/
             farmer :> mode;
@@ -549,7 +544,7 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
             if(score > 12) score = 12;  //safety check (incase you mess with the heuristic)
             int quad = (score-1)/3; //the quadrant the score is in
             int rem = score%3;
-            int pattern;
+            unsigned int pattern;
             if(rem == 1) pattern = 16;  //light pattern 001
             else if(rem == 2) pattern = 48; //light pattern 011
             else if(rem == 0) pattern = 112; //light pattern 111
@@ -579,9 +574,9 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
         } else if(mode == MODE_PAUSED) {    /***display the current generation (in binary)***/
             farmer :> mode;
             farmer :> gen;
-            int pattern[4];
+            unsigned int pattern[4];
             {pattern[0], pattern[1], pattern[2], pattern[3]} = getBinaryLightPattern(gen);
-            for(int n = 0; n < 4; n++) {
+            for(uchar n = 0; n < 4; n++) {
                 quadrants[n] <: pattern[n];
             }
             printf("Generation no. = %d\n", gen);
@@ -597,19 +592,17 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
 }
 
 //MAIN PROCESS defining channels, orchestrating and starting the threads
-//TODO: add constraints on when buttons cause state change
-//      fix testout.pgm premature end of file
 int main() {
-    chan c_inIO, c_outIO;   //channels to read and write the image
-    chan workers[4], quadrants[4];
-    chan c_01, c_12, c_23, c_30;
-    chan c_buttons, c_visualiser;
+    //channels to read and write the image, talk to buttons and the visualiser
+    chan c_inIO, c_outIO, c_buttons, c_visualiser;
+    //chans between the distributor and workers, the light quads, and for workers to communicate between each other
+    chan workers[NUM_CORES], quadrants[4], c[NUM_CORES];
     par
     {
         on stdcore[0] : buttonListener(buttons, c_buttons);
-        on stdcore[1] : DataInStream( infname, c_inIO );
-        on stdcore[2] : distributor( c_inIO, c_outIO, workers, c_buttons, c_visualiser);
-        on stdcore[3] : DataOutStream( outfname, c_outIO );
+        on stdcore[0] : DataInStream( infname, c_inIO );
+        on stdcore[0] : distributor( c_inIO, c_outIO, workers, c_buttons, c_visualiser);
+        on stdcore[0] : DataOutStream( outfname, c_outIO );
 
         on stdcore[0] : visualiser(c_visualiser, quadrants);
         on stdcore[0] : showLED(cled0, quadrants[0]);
@@ -617,11 +610,19 @@ int main() {
         on stdcore[2] : showLED(cled2, quadrants[2]);
         on stdcore[3] : showLED(cled3, quadrants[3]);
 
-        on stdcore[0] : gameoflife( workers[0], 0, c_01, c_30 );
-        on stdcore[1] : gameoflife( workers[1], 1, c_12, c_01 );
-        on stdcore[2] : gameoflife( workers[2], 2, c_23, c_12 );
-        on stdcore[3] : gameoflife( workers[3], 3, c_30, c_23 );
+        //par(int i = 0; i < NUM_CORES; i++) {
+        //    on stdcore[i] : gameoflife( workers[i], i + (4 - NUM_CORES), c[i], c[mod((NUM_CORES - 1) + i, NUM_CORES)] );
+        //}
+
+        //worker 0: c_01, c_20
+        //worker 1: c_12, c_01
+        //worker 2: c_20, c_12
+        //worker 3: c_30, c_23
+        on stdcore[1] : gameoflife( workers[0], 0, c[0], c[2] );
+        on stdcore[2] : gameoflife( workers[1], 1, c[1], c[0] );
+        on stdcore[3] : gameoflife( workers[2], 2, c[2], c[1] );
+        //on stdcore[3] : gameoflife( workers[3], 3, c[3], c[2] );
+
     }
-    //printf("Main:Done...\n");
     return 0;
 }
