@@ -15,11 +15,14 @@ typedef unsigned char uchar;
 
 #include <platform.h>
 #include <stdio.h>
+#include <math.h>
 #include "pgmIO.h"
 
-#define NUM_CORES 3 //MUST BE 3 or 4! The worker thread declarations in main must also be adjusted accordingly.
+#define NUM_CORES 5 //THIS GETS SET TO EITHER 3 OR 4 BY THE PREPROCESSOR (DEPENDING ON THE IMAGE SIZE)
 #define IMHT 256 //full height of image
 #define IMWD 256 //img width
+#define MAX_BYTES 108900        //330x330=108.9kB   = Max size can process with 3 cores
+#define FOUR_CORE_BYTES 52900   //230x230=52.9kB    = Max size can process with 4 cores
 #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 
 #define ALIVE 255
@@ -41,10 +44,22 @@ typedef unsigned char uchar;
 
 #define TERMINATE -1    //used by visualiser to tell quads to terminate
 
+#if IMHT*IMWD > MAX_BYTES   //set a flag if this image is too big for the board.
+    #define INPUT_TOO_LARGE 1
+#else
 out port cled0 = PORT_CLOCKLED_0;
 out port cled1 = PORT_CLOCKLED_1;
 out port cled2 = PORT_CLOCKLED_2;
 out port cled3 = PORT_CLOCKLED_3;
+#if IMHT*IMWD > FOUR_CORE_BYTES   //too big for 4 cores
+    #undef NUM_CORES
+    #define NUM_CORES 3
+#else   //small enough for 4 cores
+    #undef NUM_CORES
+    #define NUM_CORES 4
+#endif
+#endif
+
 out port cledG = PORT_CLOCKLED_SELG;
 out port cledR = PORT_CLOCKLED_SELR;
 
@@ -99,7 +114,7 @@ void waitMoment(int duration) {
  *
  * NOTE: with 12 bits the max number to display is 4095
  */
-{unsigned int, unsigned int, unsigned int, unsigned int} getBinaryLightPattern(int decimal) {
+{uint, uint, uint, uint} getBinaryLightPattern(int decimal) {
     if(decimal > 4095) decimal = mod(decimal, 4095);  //max val permissible is 4095
     uchar binary[12] = {0}; //binary string
     uchar i = 0;
@@ -112,7 +127,7 @@ void waitMoment(int duration) {
 
     uchar msf;
     uchar val = 0;
-    unsigned int pattern[4]; //holds each of the LED vals
+    uint pattern[4]; //holds each of the LED vals
     i = 0;
     for(int n = 0; n < 12; n+=3) {  //go through the binary in chunks of 3 bits
         val = 0;
@@ -133,7 +148,6 @@ void waitMoment(int duration) {
 //
 /////////////////////////////////////////////////////////////////////////////////////////
 void DataInStream(const char infname[], chanend c_out) {
-    printf("HEIGHT = %d\n", HEIGHT);
     int res;
     int running = 1;
     int mode = MODE_RUNNING;
@@ -305,7 +319,10 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 //
 /////////////////////////////////////////////////////////////////////////////////////////
 void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanend c_buttons, chanend c_visualiser) {
+    printf("Processing with %d cores.\n", NUM_CORES);
     uchar val;
+    uint time1, time2, timediff;
+    timer _timer;
     int running = 1;
     int buttonPress;
     int mode = MODE_IDLE;
@@ -332,6 +349,15 @@ void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanen
             c_in <: mode;
             c_out <: mode;
         } else if(mode == MODE_RUNNING) {
+            if(gen == 0) {
+                _timer :> time1;
+            } else if(gen == 100) {
+                _timer :> time2;
+                timediff = time2-time1;
+                mode = MODE_HARVEST;
+                //100000 timer ticks = 1ms
+                printf("%d\n%d\nTime to process 100 gens: ~ %fms\n", time1,time2, (float)(timediff)/100000.0);
+            }
             aliveCount = 0; //init number of alive cells
             c_buttons :> buttonPress;
             if(buttonPress == BUTTON_A) {
@@ -505,14 +531,14 @@ void buttonListener(in port b, chanend farmer) {
         if(r == BUTTON_D) {
             running = 0;
         }
-        waitMoment(1000000); //pause to let user release button
+        waitMoment(500000); //pause to let user release button
     }
     printf("Buttons terminated. Goodbye!\n");
 }
 
 //DISPLAYS an LED pattern in one quadrant of the clock LEDs
 int showLED(out port p, chanend visualiser) {
-    unsigned int lightUpPattern;
+    uint lightUpPattern;
     int running = 1;
     while (running) {
         visualiser :> lightUpPattern; //read LED pattern from visualiser process
@@ -529,23 +555,36 @@ int showLED(out port p, chanend visualiser) {
 //thread to control LED display
 void visualiser(chanend farmer, chanend quadrants[4]) {
     cledG <: 1; //make lights green
+    cledR <: 0;
     int running = 1;
     int aliveCount; //total num of alive cells
-    int gen;    //current generation
+    int gen = 0;    //current generation
     int mode = MODE_IDLE;
     while (running) {
         if(mode == MODE_IDLE || mode == MODE_FARM || mode == MODE_HARVEST) {
+            cledR <: 1;
+            cledG <: 0;
+            quadrants[0] <: 112;
+            quadrants[1] <: 112;
+            quadrants[2] <: 112;
+            quadrants[3] <: 112;
             farmer :> mode;
         } else if(mode == MODE_RUNNING) {   /***display the number of alive cells***/
+            cledG <: 1;
+            cledR <: 0;
             farmer :> mode;
             farmer :> aliveCount;
-            //score the num of alive cells in range 0-12
-            int score = (int)(12*(float)(aliveCount)/(int)(0.5 * CELLCOUNT));   //play with this 0.5 heuristic to alter sensitivity
-            if(score > 12) score = 12;  //safety check (incase you mess with the heuristic)
+            //score the num of alive cells in range 0-12 using
+            // f(x)=-(x+1/12)^(-1) + 13
+            int score = (int)(pow((-((float)(aliveCount)/(float)(CELLCOUNT))+1/12), -1) + 13);
+            if(score > 12) score = 12;  //safety check
+            if(score < 0) score = 0;  //safety check
+            //printf("frac = %f, score = %d\n", (float)(aliveCount)/(float)(CELLCOUNT), score);
             int quad = (score-1)/3; //the quadrant the score is in
             int rem = score%3;
-            unsigned int pattern;
-            if(rem == 1) pattern = 16;  //light pattern 001
+            uint pattern;
+            if(score == 0) pattern = 16;
+            else if(rem == 1) pattern = 16;  //light pattern 001
             else if(rem == 2) pattern = 48; //light pattern 011
             else if(rem == 0) pattern = 112; //light pattern 111
             //light up all quads before the one with the score in, and display the
@@ -572,9 +611,11 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
                 quadrants[3] <: pattern;
             }
         } else if(mode == MODE_PAUSED) {    /***display the current generation (in binary)***/
+            cledG <: 0;
+            cledR <: 1;
             farmer :> mode;
             farmer :> gen;
-            unsigned int pattern[4];
+            uint pattern[4];
             {pattern[0], pattern[1], pattern[2], pattern[3]} = getBinaryLightPattern(gen);
             for(uchar n = 0; n < 4; n++) {
                 quadrants[n] <: pattern[n];
@@ -582,6 +623,13 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
             printf("Generation no. = %d\n", gen);
         } else if(mode == MODE_TERMINATE) {
             running = 0;
+            cledR <: 1;
+            cledG <: 0;
+            quadrants[0] <: 112;
+            quadrants[1] <: 112;
+            quadrants[2] <: 112;
+            quadrants[3] <: 112;
+            waitMoment(10000000);
             quadrants[0] <: TERMINATE;
             quadrants[1] <: TERMINATE;
             quadrants[2] <: TERMINATE;
@@ -592,7 +640,14 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
 }
 
 //MAIN PROCESS defining channels, orchestrating and starting the threads
+//TODO: -auto choose the no. of cores
+//      -compress with 8 bits
+//      -fix button lag
 int main() {
+#ifdef INPUT_TOO_LARGE
+    printf("The input image is too large to be processed!\n");
+    return 1;
+#elif NUM_CORES == 3
     //channels to read and write the image, talk to buttons and the visualiser
     chan c_inIO, c_outIO, c_buttons, c_visualiser;
     //chans between the distributor and workers, the light quads, and for workers to communicate between each other
@@ -610,19 +665,37 @@ int main() {
         on stdcore[2] : showLED(cled2, quadrants[2]);
         on stdcore[3] : showLED(cled3, quadrants[3]);
 
-        //par(int i = 0; i < NUM_CORES; i++) {
-        //    on stdcore[i] : gameoflife( workers[i], i + (4 - NUM_CORES), c[i], c[mod((NUM_CORES - 1) + i, NUM_CORES)] );
-        //}
-
-        //worker 0: c_01, c_20
-        //worker 1: c_12, c_01
-        //worker 2: c_20, c_12
-        //worker 3: c_30, c_23
         on stdcore[1] : gameoflife( workers[0], 0, c[0], c[2] );
         on stdcore[2] : gameoflife( workers[1], 1, c[1], c[0] );
         on stdcore[3] : gameoflife( workers[2], 2, c[2], c[1] );
-        //on stdcore[3] : gameoflife( workers[3], 3, c[3], c[2] );
-
     }
     return 0;
+#elif NUM_CORES == 4
+    //channels to read and write the image, talk to buttons and the visualiser
+    chan c_inIO, c_outIO, c_buttons, c_visualiser;
+    //chans between the distributor and workers, the light quads, and for workers to communicate between each other
+    chan workers[NUM_CORES], quadrants[4], c[NUM_CORES];
+    par
+    {
+        on stdcore[0] : buttonListener(buttons, c_buttons);
+        on stdcore[1] : DataInStream( infname, c_inIO );
+        on stdcore[2] : distributor( c_inIO, c_outIO, workers, c_buttons, c_visualiser);
+        on stdcore[3] : DataOutStream( outfname, c_outIO );
+
+        on stdcore[0] : visualiser(c_visualiser, quadrants);
+        on stdcore[0] : showLED(cled0, quadrants[0]);
+        on stdcore[1] : showLED(cled1, quadrants[1]);
+        on stdcore[2] : showLED(cled2, quadrants[2]);
+        on stdcore[3] : showLED(cled3, quadrants[3]);
+
+        on stdcore[0] : gameoflife( workers[0], 0, c[0], c[3] );
+        on stdcore[1] : gameoflife( workers[1], 1, c[1], c[0] );
+        on stdcore[2] : gameoflife( workers[2], 2, c[2], c[1] );
+        on stdcore[3] : gameoflife( workers[3], 3, c[3], c[2] );
+    }
+    return 0;
+#else
+    printf("%d is an unreasonable number of cores! Can use 3 or 4 cores.\n", NUM_CORES);
+    return 1;
+#endif
 }
