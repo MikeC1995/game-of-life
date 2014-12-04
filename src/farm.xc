@@ -19,8 +19,8 @@ typedef unsigned char uchar;
 #include "pgmIO.h"
 
 #define NUM_CORES 5 //THIS GETS SET TO EITHER 3 OR 4 BY THE PREPROCESSOR (DEPENDING ON THE IMAGE SIZE)
-#define IMHT 650 //full height of image
-#define IMWD 650 //img width
+#define IMHT 512 //full height of image
+#define IMWD 512 //img width
 #define MAX_BYTES 871200 //108900        //330x330=108.9kB   = Max size can process with 3 cores
 #define FOUR_CORE_BYTES 52900   //230x230=52.9kB    = Max size can process with 4 cores
 #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
@@ -149,7 +149,7 @@ void waitMoment(int duration) {
 /////////////////////////////////////////////////////////////////////////////////////////
 void DataInStream(const char infname[], chanend c_out) {
     int res;
-    int running = 1;
+    uchar running = 1;
     int mode = MODE_RUNNING;
     uchar line[IMWD];
     printf("DataInStream:Start...\n");
@@ -186,7 +186,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
     printf("GameOfLife:Start\n");
     int mode = MODE_IDLE;
     int aliveCount = 0;
-    int running = 1;
+    uchar running = 1;
     /*  array to hold the chunk of the image to work on, with an extra
      *  line above and below for the neighbours we'll read but won't write.
      *  Only worker 0 will use the extra capacity for the remained given by IMHT%NUM_CORES
@@ -294,7 +294,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                     for(int sh = 7; sh >= 0; sh --) {
                         for(int j = -1; j <= 1; j++) {
                             for(int i = -1; i <= 1; i++) {
-                                if(i == 0 && j == 0) {
+                                if(i == 0 && j == 0) {  //dont count yourself!
                                     continue;
                                 } else {
                                     int _x = x, _sh = sh;
@@ -338,19 +338,6 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                     memcpy(buffer_img[2], img[y+2], sizeof(buffer_img[2]));
                 }
             }
-            /*if(worker_id == 2) {
-                for(int y = 0; y < h+2; y++) {
-                    printf("y = %d\n", y);
-                    for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
-                        for( int sh = 7; sh >= 0; sh --) {
-                            printf("%d ", (img[y][x] >> sh) & 1);
-                        }
-                        printf("   ");
-                    }
-                    printf("\n");
-                }
-                printf("DONE\n\n");
-            }*/
 
             /*    **** communicate changes in overlapping rows to the appropriate threads****
              *
@@ -434,9 +421,9 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanend c_buttons, chanend c_visualiser) {
     printf("Processing with %d cores.\n", NUM_CORES);
     uchar val;
-    uint time1, time2, timediff;
-    timer _timer;
-    int running = 1;
+    uint time1, time2;
+    float timediff = 0;
+    uchar running = 1;
     int buttonPress;
     int mode = MODE_IDLE;
     int aliveCount = 0; //total no. of alive cells
@@ -462,14 +449,21 @@ void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanen
             c_in <: mode;
             c_out <: mode;
         } else if(mode == MODE_RUNNING) {
+            timer _timer;
             if(gen == 0) {
                 _timer :> time1;
+            } else if(gen%10 == 0 && gen != 100) {
+                _timer :> time2;
+                timer _timer;
+                timediff += (float)(time2)/100000.0-(float)(time1)/100000.0;
+                time1 = time2;
             } else if(gen == 100) {
                 _timer :> time2;
-                timediff = time2-time1;
+                timer _timer;
+                timediff += (float)(time2)/100000.0-(float)(time1)/100000.0;;
                 mode = MODE_HARVEST;
                 //100000 timer ticks = 1ms
-                printf("%d\n%d\nTime to process 100 gens: ~ %fms\n", time1,time2, (float)(timediff)/100000.0);
+                printf("%d\n%d\nTime to process 100 gens: ~ %fms\n", time1,time2, timediff);
             }
             aliveCount = 0; //init number of alive cells
             c_buttons :> buttonPress;
@@ -589,7 +583,7 @@ void DataOutStream(const char outfname[], chanend c_in) {
     int res;
     int mode = MODE_RUNNING;
     uchar line[IMWD];
-    int running = 1;
+    uchar running = 1;
     printf("DataOutStream:Start...\n");
     while(running) {
         if(mode == MODE_RUNNING || mode == MODE_IDLE) {
@@ -623,7 +617,7 @@ void DataOutStream(const char outfname[], chanend c_in) {
 
 void buttonListener(in port b, chanend farmer) {
     int r;
-    int running = 1;
+    uchar running = 1;
     //var to prevent buttons from rapid firing when held down
     int isReleased = 1;
 
@@ -653,7 +647,7 @@ void buttonListener(in port b, chanend farmer) {
 //DISPLAYS an LED pattern in one quadrant of the clock LEDs
 int showLED(out port p, chanend visualiser) {
     uint lightUpPattern;
-    int running = 1;
+    uchar running = 1;
     while (running) {
         visualiser :> lightUpPattern; //read LED pattern from visualiser process
         if(lightUpPattern == TERMINATE) {
@@ -670,7 +664,7 @@ int showLED(out port p, chanend visualiser) {
 void visualiser(chanend farmer, chanend quadrants[4]) {
     cledG <: 1; //make lights green
     cledR <: 0;
-    int running = 1;
+    uchar running = 1;
     int aliveCount; //total num of alive cells
     int gen = 0;    //current generation
     int mode = MODE_IDLE;
@@ -771,7 +765,7 @@ int main() {
         on stdcore[0] : buttonListener(buttons, c_buttons);
         on stdcore[0] : DataInStream( infname, c_inIO );
         on stdcore[0] : distributor( c_inIO, c_outIO, workers, c_buttons, c_visualiser);
-        on stdcore[0] : DataOutStream( outfname, c_outIO );
+        on stdcore[1] : DataOutStream( outfname, c_outIO );
 
         on stdcore[0] : visualiser(c_visualiser, quadrants);
         on stdcore[0] : showLED(cled0, quadrants[0]);
