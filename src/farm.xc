@@ -19,9 +19,9 @@ typedef unsigned char uchar;
 #include "pgmIO.h"
 
 #define NUM_CORES 5 //THIS GETS SET TO EITHER 3 OR 4 BY THE PREPROCESSOR (DEPENDING ON THE IMAGE SIZE)
-#define IMHT 256 //full height of image
-#define IMWD 256 //img width
-#define MAX_BYTES 108900        //330x330=108.9kB   = Max size can process with 3 cores
+#define IMHT 650 //full height of image
+#define IMWD 650 //img width
+#define MAX_BYTES 871200 //108900        //330x330=108.9kB   = Max size can process with 3 cores
 #define FOUR_CORE_BYTES 52900   //230x230=52.9kB    = Max size can process with 4 cores
 #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 
@@ -187,13 +187,17 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
     int mode = MODE_IDLE;
     int aliveCount = 0;
     int running = 1;
-    //array to hold the chunk of the image to work on, with an extra
-    //line above and below for the neighbours we'll read but won't write
-    uchar img[HEIGHT + IMHT%NUM_CORES + 2][IMWD];
+    /*  array to hold the chunk of the image to work on, with an extra
+     *  line above and below for the neighbours we'll read but won't write.
+     *  Only worker 0 will use the extra capacity for the remained given by IMHT%NUM_CORES
+     *  If IMWD doesnt divide by 8 then add an extra byte for the remainder, (the extra bits will be padding and equal 0)
+     *  Use img[y][x] |= 1 << sh to set a bit, img[y][x] &= ~(1 << sh) to clear a bit.
+     */
+    uchar img[HEIGHT + IMHT%NUM_CORES + 2][IMWD/8 + (IMWD%8!=0?1:0)]={{0}};
     //3 lines used to read the neighbour values, (where they wont get
     //overwritten by the updating of the cells). The middle line at anytime is the line
     //to be updated.
-    uchar buffer_img[3][IMWD];
+    uchar buffer_img[3][IMWD/8 + (IMWD%8!=0?1:0)]={{0}};
     int h;  //the height of the chunk this worker is working on
     while(running) {
         if(mode == MODE_IDLE) {
@@ -203,22 +207,67 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
         } else if(mode == MODE_FARM) {
             //read data in from farmer
             farmer :> h;    //read in the chunk height this worker is processing
+            uchar val;
+            int sh; //used to track how much to shift the byte by to get to the current cell
             for (int y = 0; y < h + 2; y++) {   //+2 to compensate for the extra read-only lines
+                sh = 7;
                 for (int x = 0; x < IMWD; x++) {
+                    farmer :> val;
                     //worker0 will receive its top buffer line AFTER the rest of the chunk, so mod to put in the right place
+                    int _y = y;
                     if(worker_id == 0) {
-                        farmer :> img[mod(y+1, h + 2)][x];
+                        _y = mod(y+1, h+2);
+                    }
+                    if(val == ALIVE) {
+                        img[_y][x/8] |= 1 << sh;
                     } else {
-                        farmer :> img[y][x];
+                        img[_y][x/8] &= ~(1 << sh);
+                    }
+                    if(sh == 0) {
+                        sh = 7;
+                    } else {
+                        sh--;
+                    }
+                    //if we reach the end of the row, but havent gone throuhg the whole byte,
+                    //then pad the rest of the bits by setting them to 0
+                    if(x == IMWD - 1 && sh != 7) {
+                        while(sh >= 0) {
+                            img[_y][x/8] &= ~(1 << sh);
+                            sh--;
+                        }
                     }
                 }
             }
+            /*if(worker_id == 1) {
+                for(int y = 0; y < h+2; y++) {
+                    printf("y = %d\n", y);
+                    for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
+                        for( int sh = 7; sh >= 0; sh --) {
+                            printf("%d ", (img[y][x] >> sh) & 1);
+                        }
+                        printf("   ");
+                    }
+                    printf("\n");
+                }
+                printf("DONE\n\n");
+            }*/
             mode = MODE_RUNNING;
         } else if(mode == MODE_HARVEST) {
             //send data back to farmer
+            int sh = 7;
             for (int y = 1; y < h + 1; y++) {
+                sh = 7;
                 for (int x = 0; x < IMWD; x++) {
-                    farmer <: img[y][x];
+                    if(((img[y][x/8] >> sh) & 1) == 1) {
+                        farmer <: (uchar)(ALIVE);
+                    } else {
+                        farmer <: (uchar)(DEAD);
+                    }
+                    if(sh == 0) {
+                        sh = 7;
+                    } else {
+                        sh--;
+                    }
                 }
             }
             mode = MODE_RUNNING;
@@ -233,44 +282,54 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 
             //copy first 3 rows into buffer_img
             for(int y = 0; y < 3; y++) {
-                for(int x = 0; x < IMWD; x++) {
+                for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
                     buffer_img[y][x] = img[y][x];
                 }
             }
 
             //  *** PROCESS DATA ***
-            int n_count = 0;
+            uchar n_count = 0;
             for(int y = 1; y < h + 1; y++) {   //loop through only the parts of the image we'll write to
-                for(int x = 0; x < IMWD; x++) {
-                    for(int j = -1; j <= 1; j++) {  //loop through the neighbours
-                        for(int i = -1; i <= 1; i++) {
-                            if(i==0 && j==0) {  //careful not to count yourself as a neighbour!
-                                continue;
-                            } else {
-                                if(buffer_img[mod(1 + j, IMHT)][mod(x+i, IMWD)] == ALIVE) {  //count the neighbours
-                                    n_count++;
+                for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
+                    for(int sh = 7; sh >= 0; sh --) {
+                        for(int j = -1; j <= 1; j++) {
+                            for(int i = -1; i <= 1; i++) {
+                                if(i == 0 && j == 0) {
+                                    continue;
+                                } else {
+                                    int _x = x, _sh = sh;
+                                    //check if we need to skip to the byte ahead or before
+                                    if(sh - i < 0) {
+                                        _x++;
+                                    } else if(sh - i > 7) {
+                                        _x--;
+                                    }
+                                    if(((buffer_img[1+j][mod(_x, IMWD/8 + (IMWD%8!=0?1:0))] >> mod(sh - i, 8)) & 1) == 1) {
+                                        n_count++;
+                                    }
                                 }
                             }
                         }
-                    }
-                    //implement game of life rules
-                    if(buffer_img[1][x] == ALIVE) {
-                        aliveCount++;
-                        if(n_count < 2) {
-                            img[y][x] = DEAD;
-                        } else if(n_count == 2 || n_count == 3) {
-                            img[y][x] = ALIVE;
-                        } else if(n_count > 3) {
-                            img[y][x] = DEAD;
-                        }
-                    } else {
-                        if(n_count == 3) {
-                            img[y][x] = ALIVE;
+
+                        //apply GoL rules
+                        if(((buffer_img[1][x] >> sh) & 1) == 1) {
+                            aliveCount++;
+                            if(n_count < 2) {
+                                img[y][x] &= ~(1 << sh);
+                            } else if(n_count == 2 || n_count == 3) {
+                                img[y][x] |= 1 << sh;
+                            } else if(n_count > 3) {
+                                img[y][x] &= ~(1 << sh);
+                            }
                         } else {
-                            img[y][x] = DEAD;
+                            if(n_count == 3) {
+                                img[y][x] |= 1 << sh;
+                            } else {
+                                img[y][x] &= ~(1 << sh);
+                            }
                         }
+                        n_count = 0;
                     }
-                    n_count = 0;    //reset neighbour count for next cell
                 }
                 //shift the buffer down
                 if(y != h) {
@@ -279,6 +338,19 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                     memcpy(buffer_img[2], img[y+2], sizeof(buffer_img[2]));
                 }
             }
+            /*if(worker_id == 2) {
+                for(int y = 0; y < h+2; y++) {
+                    printf("y = %d\n", y);
+                    for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
+                        for( int sh = 7; sh >= 0; sh --) {
+                            printf("%d ", (img[y][x] >> sh) & 1);
+                        }
+                        printf("   ");
+                    }
+                    printf("\n");
+                }
+                printf("DONE\n\n");
+            }*/
 
             /*    **** communicate changes in overlapping rows to the appropriate threads****
              *
@@ -293,19 +365,60 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
              *    send my bottom *calculated* row to worker below
              *    receive my bottom *neighbour* row from worker below
              */
+            uchar val;
             if(worker_id % 2 == 0) {
-                for(int x = 0; x < IMWD; x++) {
-                    worker_below <: img[h][x];
-                    worker_below :> img[h + 1][x];
-                    worker_above :> img[0][x];
-                    worker_above <: img[1][x];
+                for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
+                    for(int sh = 7; sh >= 0; sh --) {
+                        if(((img[h][x] >> sh) & 1) == 1) {
+                            worker_below <: (uchar)(ALIVE);
+                        } else {
+                            worker_below <: (uchar)(DEAD);
+                        }
+                        worker_below :> val;
+                        if(val == ALIVE) {
+                            img[h+1][x] |= 1 << sh;
+                        } else {
+                            img[h+1][x] &= ~(1 << sh);
+                        }
+                        worker_above :> val;
+                        if(val == ALIVE) {
+                            img[0][x] |= 1 << sh;
+                        } else {
+                            img[0][x] &= ~(1 << sh);
+                        }
+                        if(((img[1][x] >> sh) & 1) == 1) {
+                            worker_above <: (uchar)(ALIVE);
+                        } else {
+                            worker_above <: (uchar)(DEAD);
+                        }
+                    }
                 }
             } else {    //odd id workers
-                for(int x = 0; x < IMWD; x++) {
-                    worker_above :> img[0][x];
-                    worker_above <: img[1][x];
-                    worker_below <: img[h][x];
-                    worker_below :> img[h + 1][x];
+                for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
+                    for(int sh = 7; sh >= 0; sh --) {
+                        worker_above :> val;
+                        if(val == ALIVE) {
+                           img[0][x] |= 1 << sh;
+                        } else {
+                           img[0][x] &= ~(1 << sh);
+                        }
+                        if(((img[1][x] >> sh) & 1) == 1) {
+                            worker_above <: (uchar)(ALIVE);
+                        } else {
+                            worker_above <: (uchar)(DEAD);
+                        }
+                        if(((img[h][x] >> sh) & 1) == 1) {
+                            worker_below <: (uchar)(ALIVE);
+                        } else {
+                            worker_below <: (uchar)(DEAD);
+                        }
+                        worker_below :> val;
+                        if(val == ALIVE) {
+                           img[h+1][x] |= 1 << sh;
+                        } else {
+                           img[h+1][x] &= ~(1 << sh);
+                        }
+                    }
                 }
             }
         }
@@ -418,6 +531,7 @@ void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanen
             }
             //Farm out the work
             for (int y = 0; y < IMHT; y++) {
+                printf("y = %d\n", y);
                 for(int x = 0; x < IMWD; x++) {
                     c_in :> val; //read in the cell value
                     //decide which workers to send this to based on whether it is between the correct boundaries.
@@ -429,16 +543,16 @@ void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanen
                         workers[1] <: val;
                     }
 #if(NUM_CORES == 3)
-                        if(y == 0 ||(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2] - 1)) {
-                            workers[2] <: val;
-                        }
+                    if(y == 0 ||(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2] - 1)) {
+                        workers[2] <: val;
+                    }
 #elif(NUM_CORES == 4)
-                        if(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2]) {
-                            workers[2] <: val;
-                        }
-                        if(y == 0 ||(y >= cumulative_heights[2] - 1 && y <= cumulative_heights[3] - 1)) {
-                            workers[3] <: val;
-                        }
+                    if(y >= cumulative_heights[1] - 1 && y <= cumulative_heights[2]) {
+                        workers[2] <: val;
+                    }
+                    if(y == 0 ||(y >= cumulative_heights[2] - 1 && y <= cumulative_heights[3] - 1)) {
+                        workers[3] <: val;
+                    }
 #endif
                 }
             }
@@ -640,9 +754,9 @@ void visualiser(chanend farmer, chanend quadrants[4]) {
 }
 
 //MAIN PROCESS defining channels, orchestrating and starting the threads
-//TODO: -auto choose the no. of cores
-//      -compress with 8 bits
+//TODO: -implement more threads per core and compare speed advantages. see the bottom of: https://www.xmos.com/published/xc-concurrency
 //      -fix button lag
+//      -implement fast neighbour count
 int main() {
 #ifdef INPUT_TOO_LARGE
     printf("The input image is too large to be processed!\n");
