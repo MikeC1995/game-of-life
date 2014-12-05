@@ -19,10 +19,10 @@ typedef unsigned char uchar;
 #include "pgmIO.h"
 
 #define NUM_CORES 5 //THIS GETS SET TO EITHER 3 OR 4 BY THE PREPROCESSOR (DEPENDING ON THE IMAGE SIZE)
-#define IMHT 512 //full height of image
-#define IMWD 512 //img width
-#define MAX_BYTES 871200 //108900        //330x330=108.9kB   = Max size can process with 3 cores
-#define FOUR_CORE_BYTES 52900   //230x230=52.9kB    = Max size can process with 4 cores
+#define IMHT 128 //full height of image
+#define IMWD 128 //img width
+#define MAX_BYTES 640000//871200 //108900        //330x330=108.9kB   = Max size can process with 3 cores
+#define FOUR_CORE_BYTES 396900   //230x230=52.9kB    = Max size can process with 4 cores
 #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 
 #define ALIVE 255
@@ -54,9 +54,13 @@ out port cled3 = PORT_CLOCKLED_3;
 #if IMHT*IMWD > FOUR_CORE_BYTES   //too big for 4 cores
     #undef NUM_CORES
     #define NUM_CORES 3
+    #undef HEIGHT
+    #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 #else   //small enough for 4 cores
     #undef NUM_CORES
     #define NUM_CORES 4
+    #undef HEIGHT
+    #define HEIGHT IMHT/NUM_CORES   //the height of a chunk processed by the worker
 #endif
 #endif
 
@@ -167,7 +171,10 @@ void DataInStream(const char infname[], chanend c_out) {
             }
 
             for (int y = 0; y < IMHT; y++) {
-                _readinline(line, IMWD);
+                if(_readinline(line, IMWD) == -1) {
+                    printf("Error reading in line!\n");
+                    return;
+                }
                 for (int x = 0; x < IMWD; x++) {
                     c_out <: line[x];
                 }
@@ -197,7 +204,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
     //3 lines used to read the neighbour values, (where they wont get
     //overwritten by the updating of the cells). The middle line at anytime is the line
     //to be updated.
-    uchar buffer_img[3][IMWD/8 + (IMWD%8!=0?1:0)]={{0}};
+    uchar buffer_img[2][IMWD/8 + (IMWD%8!=0?1:0)]={{0}};
     int h;  //the height of the chunk this worker is working on
     while(running) {
         if(mode == MODE_IDLE) {
@@ -281,7 +288,7 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
             aliveCount = 0;
 
             //copy first 3 rows into buffer_img
-            for(int y = 0; y < 3; y++) {
+            for(int y = 0; y < 2; y++) {
                 for(int x = 0; x < IMWD/8 + (IMWD%8!=0?1:0); x++) {
                     buffer_img[y][x] = img[y][x];
                 }
@@ -304,8 +311,14 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                                     } else if(sh - i > 7) {
                                         _x--;
                                     }
-                                    if(((buffer_img[1+j][mod(_x, IMWD/8 + (IMWD%8!=0?1:0))] >> mod(sh - i, 8)) & 1) == 1) {
-                                        n_count++;
+                                    if(j != 1) {
+                                        if(((buffer_img[1+j][mod(_x, IMWD/8 + (IMWD%8!=0?1:0))] >> mod(sh - i, 8)) & 1) == 1) {
+                                            n_count++;
+                                        }
+                                    } else {
+                                        if(((img[y + 1][mod(_x, IMWD/8 + (IMWD%8!=0?1:0))] >> mod(sh - i, 8)) & 1) == 1) {
+                                            n_count++;
+                                        }
                                     }
                                 }
                             }
@@ -332,10 +345,9 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
                     }
                 }
                 //shift the buffer down
-                if(y != h) {
+                if(y != h ) {
                     memcpy(buffer_img[0], buffer_img[1], sizeof(buffer_img[0]));
-                    memcpy(buffer_img[1], buffer_img[2], sizeof(buffer_img[1]));
-                    memcpy(buffer_img[2], img[y+2], sizeof(buffer_img[2]));
+                    memcpy(buffer_img[1], img[y + 1], sizeof(buffer_img[1]));
                 }
             }
 
@@ -421,8 +433,10 @@ void gameoflife(chanend farmer, int worker_id, chanend worker_below, chanend wor
 void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanend c_buttons, chanend c_visualiser) {
     printf("Processing with %d cores.\n", NUM_CORES);
     uchar val;
-    uint time1, time2;
-    float timediff = 0;
+    uint t1, t2;
+    uint td;
+    unsigned long tt1 = 0;
+    unsigned long tt2 = 0;
     uchar running = 1;
     int buttonPress;
     int mode = MODE_IDLE;
@@ -451,19 +465,24 @@ void distributor(chanend c_in, chanend c_out, chanend workers[NUM_CORES], chanen
         } else if(mode == MODE_RUNNING) {
             timer _timer;
             if(gen == 0) {
-                _timer :> time1;
-            } else if(gen%10 == 0 && gen != 100) {
-                _timer :> time2;
-                timer _timer;
-                timediff += (float)(time2)/100000.0-(float)(time1)/100000.0;
-                time1 = time2;
+                _timer :> t1;
+            } else if(gen%10 == 0 && gen <= 50) {
+                _timer :> t2;
+                tt1 += t2 - t1;
+                td = t2 - t1;
+                t1 = t2;
+            } else if(gen%10 == 0 && gen > 50 && gen != 100) {
+               _timer :> t2;
+               tt2 += t2 - t1;
+               td = t2 - t1;
+               t1 = t2;
             } else if(gen == 100) {
-                _timer :> time2;
-                timer _timer;
-                timediff += (float)(time2)/100000.0-(float)(time1)/100000.0;;
+                _timer :> t2;
+                tt2 += t2 - t1;
+                td = t2 - t1;
                 mode = MODE_HARVEST;
                 //100000 timer ticks = 1ms
-                printf("%d\n%d\nTime to process 100 gens: ~ %fms\n", time1,time2, timediff);
+                printf("%d generations in %u + %u ticks\n", gen, tt1, tt2);
             }
             aliveCount = 0; //init number of alive cells
             c_buttons :> buttonPress;

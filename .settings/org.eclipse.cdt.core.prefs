@@ -1,11 +1,21 @@
-#Thu Dec 04 13:32:28 GMT 2014
+#Fri Dec 05 14:33:17 GMT 2014
 eclipse.preferences.version=1
-environment/project/com.xmos.cdt.toolchain.1727831551/XMOS_MODULE_PATH/delimiter=;
+environment/project/com.xmos.cdt.toolchain.103570106/XMOS_MODULE_PATH/delimiter=\:
+environment/project/com.xmos.cdt.toolchain.103570106/XMOS_MODULE_PATH/operation=append
+environment/project/com.xmos.cdt.toolchain.103570106/XMOS_MODULE_PATH/value=
+environment/project/com.xmos.cdt.toolchain.103570106/append=true
+environment/project/com.xmos.cdt.toolchain.103570106/appendContributed=true
+environment/project/com.xmos.cdt.toolchain.1308666116/XMOS_MODULE_PATH/delimiter=\:
+environment/project/com.xmos.cdt.toolchain.1308666116/XMOS_MODULE_PATH/operation=append
+environment/project/com.xmos.cdt.toolchain.1308666116/XMOS_MODULE_PATH/value=
+environment/project/com.xmos.cdt.toolchain.1308666116/append=true
+environment/project/com.xmos.cdt.toolchain.1308666116/appendContributed=true
+environment/project/com.xmos.cdt.toolchain.1727831551/XMOS_MODULE_PATH/delimiter=\:
 environment/project/com.xmos.cdt.toolchain.1727831551/XMOS_MODULE_PATH/operation=append
 environment/project/com.xmos.cdt.toolchain.1727831551/XMOS_MODULE_PATH/value=
 environment/project/com.xmos.cdt.toolchain.1727831551/append=true
 environment/project/com.xmos.cdt.toolchain.1727831551/appendContributed=true
-environment/project/com.xmos.cdt.toolchain.761079435/XMOS_MODULE_PATH/delimiter=;
+environment/project/com.xmos.cdt.toolchain.761079435/XMOS_MODULE_PATH/delimiter=\:
 environment/project/com.xmos.cdt.toolchain.761079435/XMOS_MODULE_PATH/operation=append
 environment/project/com.xmos.cdt.toolchain.761079435/XMOS_MODULE_PATH/value=
 environment/project/com.xmos.cdt.toolchain.761079435/append=true
